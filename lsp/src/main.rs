@@ -21,9 +21,13 @@ use serde_json::json;
 use std::{
     collections::{HashMap, HashSet},
     env,
+    fs::{self, DirBuilder},
     hash::{DefaultHasher, Hash, Hasher},
+    io::ErrorKind,
+    os::unix::fs::{DirBuilderExt, MetadataExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Arc, Mutex},
 };
 
 const CMD_PREVIEW: &str = "mermaid.preview";
@@ -38,7 +42,24 @@ const CMD_EXPORT_SVG: &str = "mermaid.exportSvg";
 struct State {
     documents: HashMap<String, String>,
     previewing: HashSet<String>,
+    /// Per-URI render coordination, shared with the detached render threads.
+    renders: Renders,
 }
+
+/// Tracks the in-flight render for one preview URI so rapid autosaves coalesce into at
+/// most one running render plus one queued follow-up, and so didClose can defer temp
+/// cleanup until the render thread is done touching the directory.
+#[derive(Default)]
+struct RenderSlot {
+    /// A render thread is currently running for this URI.
+    rendering: bool,
+    /// The newest source that arrived while a render was running; rendered next.
+    pending: Option<String>,
+    /// The source document closed mid-render; the thread cleans up when it finishes.
+    closing: bool,
+}
+
+type Renders = Arc<Mutex<HashMap<String, RenderSlot>>>;
 
 fn main() -> Result<()> {
     eprintln!("mermaid-quicklook-lsp starting");
@@ -92,6 +113,14 @@ fn main() -> Result<()> {
     // hangs on exit instead of terminating.
     drop(connection);
     io_threads.join()?;
+
+    // Sweep this session's per-document preview directories. We only touch our own
+    // <hash> subdirs, never the shared base dir, which other instances may still use.
+    for uri in &state.previewing {
+        if let Ok(dir) = preview_dir(uri) {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
 
     eprintln!("mermaid-quicklook-lsp exiting");
     Ok(())
@@ -165,7 +194,7 @@ fn handle_notification(connection: &Connection, state: &mut State, notification:
                 if state.previewing.contains(&uri) {
                     if let Some(source) = state.documents.get(&uri).cloned() {
                         // Overwrite the same file the preview tab is showing; Zed repaints it.
-                        refresh_preview(&connection.sender, uri, source);
+                        refresh_preview(&connection.sender, &state.renders, uri, source);
                     }
                 }
             }
@@ -177,9 +206,7 @@ fn handle_notification(connection: &Connection, state: &mut State, notification:
                 let uri = params.text_document.uri.to_string();
                 state.documents.remove(&uri);
                 state.previewing.remove(&uri);
-                if let Ok(path) = preview_path(&uri) {
-                    let _ = std::fs::remove_file(path);
-                }
+                close_preview(&state.renders, &uri);
             }
         }
         _ => {}
@@ -249,41 +276,111 @@ fn execute_command(
             state.previewing.insert(uri);
             Ok(())
         }
-        CMD_EXPORT_PNG => export(connection, &uri, &source, "png"),
-        CMD_EXPORT_SVG => export(connection, &uri, &source, "svg"),
+        CMD_EXPORT_PNG => export(&connection.sender, &uri, &source, "png"),
+        CMD_EXPORT_SVG => export(&connection.sender, &uri, &source, "svg"),
         other => Err(anyhow!("unknown command: {other}")),
     }
 }
 
-fn export(connection: &Connection, uri: &str, source: &str, format: &str) -> Result<()> {
+/// Export writes next to the source file and takes a second or two. Run it off the main
+/// loop so a long render does not stall every other LSP request; report the outcome via
+/// a window/showMessage toast, just as an inline render would.
+fn export(sender: &Sender<Message>, uri: &str, source: &str, format: &str) -> Result<()> {
     let target = source_path(uri)?.with_extension(format);
-    render::render(source, &target)?;
-    show_info(
-        &connection.sender,
-        &format!("Exported {}", target.display()),
-    );
+    let sender = sender.clone();
+    let source = source.to_string();
+
+    std::thread::spawn(move || match render::render(&source, &target) {
+        Ok(()) => show_info(&sender, &format!("Exported {}", target.display())),
+        Err(error) => show_error(&sender, &format!("Mermaid export failed: {error}")),
+    });
+
     Ok(())
 }
 
 /// Re-render an open preview off the main loop. mmdc boots Chromium and takes a second
 /// or two; blocking here would stall every other LSP request behind a save.
-fn refresh_preview(sender: &Sender<Message>, uri: String, source: String) {
+///
+/// Single-flight per URI: if a render is already running, we just record the newest
+/// source as `pending` (overwriting any earlier queued source) instead of spawning a
+/// second Chromium. When the running render finishes it picks up that pending source and
+/// renders once more. Net: at most one in-flight render plus one queued, per URI.
+fn refresh_preview(sender: &Sender<Message>, renders: &Renders, uri: String, source: String) {
+    {
+        let mut map = renders.lock().unwrap();
+        let slot = map.entry(uri.clone()).or_default();
+        if slot.rendering {
+            slot.pending = Some(source);
+            return;
+        }
+        slot.rendering = true;
+    }
+
     let sender = sender.clone();
+    let renders = renders.clone();
     std::thread::spawn(move || {
         let target = match preview_path(&uri) {
             Ok(target) => target,
             Err(error) => {
                 show_error(&sender, &error.to_string());
+                renders.lock().unwrap().remove(&uri);
                 return;
             }
         };
 
-        if let Err(error) = render::render(&source, &target) {
-            // A syntax error mid-edit is normal and expected. Report it, but leave the
-            // last good render in the tab rather than blanking it.
-            show_error(&sender, &format!("Mermaid: {error}"));
+        let mut current = source;
+        loop {
+            if let Err(error) = render::render(&current, &target) {
+                // A syntax error mid-edit is normal and expected. Report it, but leave
+                // the last good render in the tab rather than blanking it.
+                show_error(&sender, &format!("Mermaid: {error}"));
+            }
+
+            let mut map = renders.lock().unwrap();
+            let slot = map.entry(uri.clone()).or_default();
+            if slot.closing {
+                // The document closed while we rendered; clean up its temp dir now that
+                // no render is touching it.
+                map.remove(&uri);
+                drop(map);
+                remove_preview_dir(&uri);
+                return;
+            }
+            match slot.pending.take() {
+                Some(next) => current = next,
+                None => {
+                    slot.rendering = false;
+                    return;
+                }
+            }
         }
     });
+}
+
+/// Tear down a preview's temp directory when its source document closes. If a render is
+/// in flight we defer to that thread (via `closing`) rather than yanking the directory
+/// out from under it.
+fn close_preview(renders: &Renders, uri: &str) {
+    {
+        let mut map = renders.lock().unwrap();
+        if let Some(slot) = map.get_mut(uri) {
+            if slot.rendering {
+                slot.closing = true;
+                slot.pending = None;
+                return;
+            }
+        }
+        map.remove(uri);
+    }
+    remove_preview_dir(uri);
+}
+
+/// Remove this document's `<hash>` preview directory and everything in it. Never removes
+/// the shared base directory, which other instances may still be using.
+fn remove_preview_dir(uri: &str) {
+    if let Ok(dir) = preview_dir(uri) {
+        let _ = fs::remove_dir_all(dir);
+    }
 }
 
 /// Ask the running Zed instance to open the rendered image as a tab.
@@ -299,7 +396,13 @@ fn open_in_editor(path: &Path) -> Result<()> {
             .stderr(Stdio::null())
             .spawn();
 
-        if spawned.is_ok() {
+        if let Ok(child) = spawned {
+            // Reap the launcher so it does not linger as a zombie. Detached, so the
+            // caller is not blocked on the GUI process.
+            std::thread::spawn(move || {
+                let mut child = child;
+                let _ = child.wait();
+            });
             return Ok(());
         }
     }
@@ -321,6 +424,76 @@ fn source_path(uri: &str) -> Result<PathBuf> {
         .map_err(|_| anyhow!("document is not a local file: {uri}"))
 }
 
+/// Per-user base directory for all previews. Everything below it inherits its 0700,
+/// user-only access, which is what neutralizes the /tmp symlink-planting and diagram
+/// disclosure risks: an attacker cannot traverse into, read, or plant paths inside a
+/// directory only the victim can enter.
+///
+/// Prefers `$XDG_RUNTIME_DIR` (on Linux that is /run/user/UID, already a private 0700
+/// tmpfs), falling back to a euid-qualified name under the system temp dir. Either way
+/// the directory is created 0700, and if it already exists it must be a real directory
+/// owned by us with exactly 0700 permissions or we refuse to use it.
+fn base_dir() -> Result<PathBuf> {
+    // SAFETY: geteuid is always successful and has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+
+    let base = match env::var_os("XDG_RUNTIME_DIR") {
+        Some(runtime) if Path::new(&runtime).is_dir() => {
+            Path::new(&runtime).join("zed-mermaid-quicklook")
+        }
+        _ => env::temp_dir().join(format!("zed-mermaid-quicklook-{euid}")),
+    };
+
+    ensure_secure_dir(&base, euid)?;
+    Ok(base)
+}
+
+/// Create `dir` as a private 0700 directory, or verify an existing one is safe to reuse.
+/// Uses `symlink_metadata` so a planted symlink is seen as a symlink (not its target)
+/// and rejected.
+fn ensure_secure_dir(dir: &Path, euid: u32) -> Result<()> {
+    match fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            if !meta.file_type().is_dir() {
+                return Err(anyhow!(
+                    "refusing to use {}: not a directory (possible symlink attack)",
+                    dir.display()
+                ));
+            }
+            if meta.uid() != euid {
+                return Err(anyhow!(
+                    "refusing to use {}: owned by uid {}, not {euid}",
+                    dir.display(),
+                    meta.uid()
+                ));
+            }
+            if meta.mode() & 0o777 != 0o700 {
+                return Err(anyhow!(
+                    "refusing to use {}: permissions are {:04o}, expected 0700",
+                    dir.display(),
+                    meta.mode() & 0o777
+                ));
+            }
+            Ok(())
+        }
+        // Non-recursive create issues a single mkdir(2): if the directory is planted
+        // between the stat above and here, this fails with EEXIST rather than adopting
+        // it. The parent (XDG_RUNTIME_DIR or the system temp dir) always exists already.
+        Err(error) if error.kind() == ErrorKind::NotFound => DirBuilder::new()
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("creating {}", dir.display())),
+        Err(error) => Err(error).with_context(|| format!("inspecting {}", dir.display())),
+    }
+}
+
+/// Stable per-document directory (`<base>/<hash>`), holding just this document's preview.
+fn preview_dir(uri: &str) -> Result<PathBuf> {
+    let mut hasher = DefaultHasher::new();
+    uri.hash(&mut hasher);
+    Ok(base_dir()?.join(format!("{:016x}", hasher.finish())))
+}
+
 /// Stable per-document path, so re-rendering overwrites the file the preview tab holds
 /// open. The basename is the source's, so the tab reads `diagram.png` rather than a hash.
 fn preview_path(uri: &str) -> Result<PathBuf> {
@@ -330,13 +503,7 @@ fn preview_path(uri: &str) -> Result<PathBuf> {
         .and_then(|stem| stem.to_str())
         .unwrap_or("diagram");
 
-    let mut hasher = DefaultHasher::new();
-    uri.hash(&mut hasher);
-
-    Ok(env::temp_dir()
-        .join("zed-mermaid-quicklook")
-        .join(format!("{:016x}", hasher.finish()))
-        .join(format!("{stem}.png")))
+    Ok(preview_dir(uri)?.join(format!("{stem}.png")))
 }
 
 fn show_error(sender: &Sender<Message>, message: &str) {
