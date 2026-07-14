@@ -1,3 +1,8 @@
+; Taken verbatim from tree-sitter-mermaid's own queries/highlights.scm.
+; https://github.com/monaqa/tree-sitter-mermaid
+;
+; MIT License. Copyright (c) 2022 Mogami Shinichi.
+
 [
  "sequenceDiagram"
  "classDiagram"

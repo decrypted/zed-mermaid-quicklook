@@ -122,10 +122,14 @@ fn handle_notification(connection: &Connection, state: &mut State, notification:
     match notification.method.as_str() {
         "textDocument/didOpen" => {
             if let Ok(params) = serde_json::from_value::<DidOpenTextDocumentParams>(notification.params) {
-                state.documents.insert(
-                    params.text_document.uri.to_string(),
-                    params.text_document.text,
+                let uri = params.text_document.uri.to_string();
+                let text = params.text_document.text;
+                eprintln!(
+                    "didOpen {uri} ({} bytes, {} lines)",
+                    text.len(),
+                    text.lines().count()
                 );
+                state.documents.insert(uri, text);
             }
         }
         "textDocument/didChange" => {
@@ -213,6 +217,13 @@ fn execute_command(
         .get(&uri)
         .cloned()
         .ok_or_else(|| anyhow!("document is not open: {uri}"))?;
+
+    eprintln!(
+        "command {} on {uri} ({} bytes, {} lines)",
+        params.command,
+        source.len(),
+        source.lines().count()
+    );
 
     match params.command.as_str() {
         CMD_PREVIEW => {

@@ -7,7 +7,7 @@ use std::{
 
 /// Scale factor for PNG output. Zed's image viewer zooms, so render above display
 /// resolution to keep the diagram sharp when zoomed in.
-const PNG_SCALE: &str = "3";
+const PNG_SCALE: &str = "6";
 
 pub fn mmdc_path() -> Result<PathBuf> {
     if let Ok(path) = env::var("MMDC_PATH") {
@@ -32,6 +32,7 @@ pub fn render(source: &str, output: &Path) -> Result<()> {
     }
 
     let mmdc = mmdc_path()?;
+    let source = strip_empty_comments(source);
     let format = output
         .extension()
         .and_then(|ext| ext.to_str())
@@ -44,7 +45,7 @@ pub fn render(source: &str, output: &Path) -> Result<()> {
 
     let scratch = tempfile::tempdir().context("creating temp dir")?;
     let input = scratch.path().join("diagram.mmd");
-    fs::write(&input, source).context("writing diagram source")?;
+    fs::write(&input, &source).context("writing diagram source")?;
 
     // Stage inside the destination directory so the rename below stays on one
     // filesystem, which is what makes it atomic.
@@ -69,12 +70,21 @@ pub fn render(source: &str, output: &Path) -> Result<()> {
         command.arg("-s").arg(PNG_SCALE);
     }
 
+    eprintln!(
+        "render: {} bytes -> {} (mmdc {})",
+        source.len(),
+        output.display(),
+        mmdc.display()
+    );
+
     let result = command.output().context("running mmdc")?;
 
     if !result.status.success() {
         let _ = fs::remove_file(&staged);
         let stderr = String::from_utf8_lossy(&result.stderr);
-        return Err(anyhow!("{}", first_useful_line(&stderr)));
+        let summary = error_summary(&stderr);
+        eprintln!("render failed: {summary}");
+        return Err(anyhow!("{summary}"));
     }
 
     fs::rename(&staged, output)
@@ -83,14 +93,52 @@ pub fn render(source: &str, output: &Path) -> Result<()> {
     Ok(())
 }
 
-/// mmdc prints Chromium/puppeteer noise around the actual syntax error. Surface the
-/// part a user can act on, since this ends up in a Zed toast.
-fn first_useful_line(stderr: &str) -> String {
-    let error = stderr
+/// Mermaid's parser rejects a comment marker with nothing after it (`%%` alone on a
+/// line), and misreports the position as line 1. People use those as spacers in comment
+/// headers, so drop them rather than making the user hunt for it.
+fn strip_empty_comments(source: &str) -> String {
+    source
+        .lines()
+        .filter(|line| line.trim() != "%%")
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// mmdc wraps the real syntax error in Chromium/puppeteer stack noise. Keep the part a
+/// user can act on -- the message plus Mermaid's caret and "Expecting ..." detail -- and
+/// cut the stack, since this ends up in a Zed toast.
+fn error_summary(stderr: &str) -> String {
+    let useful: Vec<&str> = stderr
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with("Generating"))
-        .unwrap_or("mmdc failed");
+        .filter(|line| !line.is_empty() && !line.starts_with("Generating"))
+        .take_while(|line| !line.starts_with("at "))
+        .take(6)
+        .collect();
 
-    error.to_string()
+    if useful.is_empty() {
+        return "mmdc failed".to_string();
+    }
+
+    useful.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_empty_comments;
+
+    #[test]
+    fn drops_bare_comment_markers_but_keeps_real_comments() {
+        let source = "%% header\n%%\n%% more\n\nflowchart TB\n  A-->B\n";
+        assert_eq!(
+            strip_empty_comments(source),
+            "%% header\n%% more\n\nflowchart TB\n  A-->B"
+        );
+    }
+
+    #[test]
+    fn leaves_diagram_body_alone() {
+        let source = "flowchart TB\n  %% a note\n  A-->B";
+        assert_eq!(strip_empty_comments(source), source);
+    }
 }

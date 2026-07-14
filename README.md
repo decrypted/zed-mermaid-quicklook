@@ -49,6 +49,15 @@ with the image viewer's controls.
 If a diagram has a syntax error, you get an error toast and the preview keeps showing
 the last render that worked, rather than going blank.
 
+## Credits
+
+Inspired by [dawsh2/zed-mermaid-preview](https://github.com/dawsh2/zed-mermaid-preview),
+which renders diagrams by rewriting your Markdown in place. This takes the opposite
+approach: preview only, source untouched.
+
+Syntax highlighting comes from [monaqa/tree-sitter-mermaid](https://github.com/monaqa/tree-sitter-mermaid)
+(`languages/mermaid/highlights.scm` is that grammar's own query file, MIT, © 2022 Mogami Shinichi).
+
 ## Notes
 
 - Preview files live in `/tmp/zed-mermaid-quicklook/` and are removed when you close the
@@ -57,3 +66,11 @@ the last render that worked, rather than going blank.
   text document), so closing the preview isn't something this can detect. It just keeps
   re-rendering on save while the source file is open; the cost of guessing wrong is one
   wasted render.
+- Mermaid's parser rejects a comment marker with nothing after it (`%%` alone on a line)
+  and blames line 1 regardless of where it actually is. Those lines are stripped before
+  rendering, so a `%%` spacer in a comment header works here even though it fails in
+  plain `mmdc`.
+
+## License
+
+MIT

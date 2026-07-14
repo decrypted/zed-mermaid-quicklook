@@ -4,7 +4,7 @@ description = "Preview Mermaid diagrams (.mmd) as an image tab in Zed. Never mod
 version = "0.1.0"
 schema_version = 1
 authors = ["Daniel Rudolph"]
-repository = "https://github.com/dawsh2/zed-mermaid-preview"
+repository = "https://github.com/decrypted/zed-mermaid-quicklook"
 languages = ["languages/mermaid"]
 
 [lib]
