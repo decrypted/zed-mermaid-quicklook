@@ -1,0 +1,20 @@
+id = "mermaid-quicklook"
+name = "Mermaid Quicklook"
+description = "Preview Mermaid diagrams (.mmd) as an image tab in Zed. Never modifies your files."
+version = "0.1.0"
+schema_version = 1
+authors = ["Daniel Rudolph"]
+repository = "https://github.com/dawsh2/zed-mermaid-preview"
+languages = ["languages/mermaid"]
+
+[lib]
+kind = "Rust"
+version = "0.7.0"
+
+[language_servers.mermaid-quicklook]
+name = "Mermaid Quicklook"
+languages = ["Mermaid"]
+
+[grammars.mermaid]
+repository = "https://github.com/monaqa/tree-sitter-mermaid"
+rev = "90ae195b31933ceb9d079abfa8a3ad0a36fee4cc"
