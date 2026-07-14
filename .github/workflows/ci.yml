@@ -59,6 +59,13 @@ jobs:
         with:
           node-version: 22
 
+      # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor, which stops
+      # Puppeteer's Chromium from starting its sandbox. Lift the restriction on the
+      # runner rather than passing --no-sandbox to mmdc: that flag would disable the
+      # sandbox for real users too, and this job exists to exercise the path they run.
+      - name: Allow Chromium's sandbox
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Install Mermaid CLI
         run: npm install -g @mermaid-js/mermaid-cli
 
