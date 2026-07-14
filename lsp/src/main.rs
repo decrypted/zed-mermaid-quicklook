@@ -10,11 +10,12 @@ use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::Sender;
 use lsp_server::{Connection, Message, Notification, Request, Response};
 use lsp_types::{
-    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, CodeActionProviderCapability,
-    Command as LspCommand, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, ExecuteCommandOptions, ExecuteCommandParams, MessageType,
-    ServerCapabilities, ShowMessageParams, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Url, WorkDoneProgressOptions,
+    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
+    CodeActionProviderCapability, Command as LspCommand, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, ExecuteCommandOptions,
+    ExecuteCommandParams, MessageType, ServerCapabilities, ShowMessageParams,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, Url, WorkDoneProgressOptions,
 };
 use serde_json::json;
 use std::{
@@ -46,12 +47,14 @@ fn main() -> Result<()> {
 
     let capabilities = serde_json::to_value(ServerCapabilities {
         // Diagrams are small; full sync keeps the server trivially correct.
-        text_document_sync: Some(TextDocumentSyncCapability::Options(TextDocumentSyncOptions {
-            open_close: Some(true),
-            change: Some(TextDocumentSyncKind::FULL),
-            save: Some(TextDocumentSyncSaveOptions::Supported(true)),
-            ..Default::default()
-        })),
+        text_document_sync: Some(TextDocumentSyncCapability::Options(
+            TextDocumentSyncOptions {
+                open_close: Some(true),
+                change: Some(TextDocumentSyncKind::FULL),
+                save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+                ..Default::default()
+            },
+        )),
         code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         execute_command_provider: Some(ExecuteCommandOptions {
             commands: vec![
@@ -84,7 +87,13 @@ fn main() -> Result<()> {
         }
     }
 
+    // The connection owns the sender feeding the writer thread. Joining before dropping
+    // it deadlocks: the writer waits on a channel that can never close, so the process
+    // hangs on exit instead of terminating.
+    drop(connection);
     io_threads.join()?;
+
+    eprintln!("mermaid-quicklook-lsp exiting");
     Ok(())
 }
 
@@ -92,8 +101,9 @@ fn handle_request(connection: &Connection, state: &mut State, request: Request) 
     let id = request.id.clone();
 
     let result = match request.method.as_str() {
-        "textDocument/codeAction" => cast::<CodeActionParams>(request)
-            .map(|params| json!(code_actions(&params))),
+        "textDocument/codeAction" => {
+            cast::<CodeActionParams>(request).map(|params| json!(code_actions(&params)))
+        }
         "workspace/executeCommand" => cast::<ExecuteCommandParams>(request).map(|params| {
             if let Err(error) = execute_command(connection, state, &params) {
                 show_error(&connection.sender, &error.to_string());
@@ -121,7 +131,9 @@ fn cast<P: serde::de::DeserializeOwned>(request: Request) -> Result<P> {
 fn handle_notification(connection: &Connection, state: &mut State, notification: Notification) {
     match notification.method.as_str() {
         "textDocument/didOpen" => {
-            if let Ok(params) = serde_json::from_value::<DidOpenTextDocumentParams>(notification.params) {
+            if let Ok(params) =
+                serde_json::from_value::<DidOpenTextDocumentParams>(notification.params)
+            {
                 let uri = params.text_document.uri.to_string();
                 let text = params.text_document.text;
                 eprintln!(
@@ -146,7 +158,9 @@ fn handle_notification(connection: &Connection, state: &mut State, notification:
             }
         }
         "textDocument/didSave" => {
-            if let Ok(params) = serde_json::from_value::<DidSaveTextDocumentParams>(notification.params) {
+            if let Ok(params) =
+                serde_json::from_value::<DidSaveTextDocumentParams>(notification.params)
+            {
                 let uri = params.text_document.uri.to_string();
                 if state.previewing.contains(&uri) {
                     if let Some(source) = state.documents.get(&uri).cloned() {
@@ -157,7 +171,9 @@ fn handle_notification(connection: &Connection, state: &mut State, notification:
             }
         }
         "textDocument/didClose" => {
-            if let Ok(params) = serde_json::from_value::<DidCloseTextDocumentParams>(notification.params) {
+            if let Ok(params) =
+                serde_json::from_value::<DidCloseTextDocumentParams>(notification.params)
+            {
                 let uri = params.text_document.uri.to_string();
                 state.documents.remove(&uri);
                 state.previewing.remove(&uri);
